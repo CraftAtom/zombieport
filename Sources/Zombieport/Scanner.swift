@@ -28,6 +28,13 @@ struct DevProcess: Identifiable, Equatable {
     /// by design, so flagging them would make "zombie" meaningless.
     var isZombie: Bool { kind == .process && ppid == 1 && Scanner.isDevRuntime(command) }
 
+    /// A dev server that has run for at least `seconds`, which usually means you forgot it.
+    /// Containers are excluded because databases and caches often run for days on purpose.
+    func isStale(after seconds: Int?) -> Bool {
+        guard let seconds else { return false }
+        return kind == .process && uptimeSeconds >= seconds && Scanner.isDevRuntime(command)
+    }
+
     var uptime: String {
         let d = uptimeSeconds / 86400, h = uptimeSeconds % 86400 / 3600, m = uptimeSeconds % 3600 / 60
         if d > 0 { return "\(d)d \(h)h" }

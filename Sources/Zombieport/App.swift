@@ -34,7 +34,9 @@ enum Main {
         if CommandLine.arguments.contains("--list") {
             for p in Scanner.scan(showAll: CommandLine.arguments.contains("--all")) {
                 let pid = p.kind == .container ? "-" : String(p.pid)
-                let state = p.kind == .container ? "container" : (p.isZombie ? "zombie" : "process")
+                let state = p.kind == .container ? "container"
+                    : p.isZombie ? "zombie"
+                    : p.isStale(after: BadgeMode.staleDay.staleAfter) ? "stale" : "process"
                 print("\(pid)\t\(p.portsLabel)\t\(p.projectName)\t\(p.repoName ?? "-")\t\(p.script)\t\(p.displayPath)\t\(state)")
             }
             return
@@ -64,6 +66,33 @@ enum LoginItem {
     }
 }
 
+/// What the menu bar number counts.
+enum BadgeMode: String, CaseIterable {
+    case staleDay, staleThreeDays, zombies, all
+
+    var title: String {
+        switch self {
+        case .staleDay: "Zombies + Older Than 24 Hours"
+        case .staleThreeDays: "Zombies + Older Than 3 Days"
+        case .zombies: "Zombies Only"
+        case .all: "All Servers"
+        }
+    }
+
+    /// Uptime after which a dev server counts as stale, or nil when age doesn't matter.
+    var staleAfter: Int? {
+        switch self {
+        case .staleDay: 86400
+        case .staleThreeDays: 3 * 86400
+        case .zombies, .all: nil
+        }
+    }
+
+    func counts(_ p: DevProcess) -> Bool {
+        self == .all || p.isZombie || p.isStale(after: staleAfter)
+    }
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let store = ProcessStore()
     private var statusItem: NSStatusItem!
@@ -78,7 +107,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             button.action = #selector(statusItemClicked)
             button.sendAction(on: [.leftMouseUp, .rightMouseUp])
         }
-        cancellable = store.$processes.sink { [weak self] in self?.updateStatusItem(count: $0.count) }
+        cancellable = store.$processes.combineLatest(store.$badgeMode).sink { [weak self] processes, mode in
+            self?.updateStatusItem(count: processes.filter(mode.counts).count)
+        }
         if CommandLine.arguments.contains("--show") { showWindow() }
     }
 
@@ -123,6 +154,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let menu = NSMenu()
             menu.addItem(withTitle: "Open Zombieport", action: #selector(showWindow), keyEquivalent: "").target = self
             menu.addItem(.separator())
+            let badge = NSMenu()
+            for mode in BadgeMode.allCases {
+                let item = NSMenuItem(title: mode.title, action: #selector(setBadgeMode), keyEquivalent: "")
+                item.target = self
+                item.representedObject = mode.rawValue
+                item.state = store.badgeMode == mode ? .on : .off
+                badge.addItem(item)
+            }
+            let badgeItem = NSMenuItem(title: "Badge Counts", action: nil, keyEquivalent: "")
+            badgeItem.submenu = badge
+            menu.addItem(badgeItem)
+            menu.addItem(.separator())
             let login = NSMenuItem(title: "Launch at Login", action: #selector(toggleLoginItem), keyEquivalent: "")
             login.target = self
             login.state = LoginItem.isEnabled ? .on : .off
@@ -138,6 +181,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             window.orderOut(nil)
         } else {
             showWindow()
+        }
+    }
+
+    @objc private func setBadgeMode(_ sender: NSMenuItem) {
+        if let raw = sender.representedObject as? String, let mode = BadgeMode(rawValue: raw) {
+            store.badgeMode = mode
         }
     }
 
@@ -180,6 +229,9 @@ final class ProcessStore: ObservableObject {
             refresh()
         }
     }
+    @Published var badgeMode = BadgeMode(rawValue: UserDefaults.standard.string(forKey: "badgeMode") ?? "") ?? .staleDay {
+        didSet { UserDefaults.standard.set(badgeMode.rawValue, forKey: "badgeMode") }
+    }
     /// Rows that couldn't be stopped, shown in an alert.
     @Published var killFailures: [String] = []
     private var timer: Timer?
@@ -206,6 +258,8 @@ final class ProcessStore: ObservableObject {
     }
 
     var zombies: [DevProcess] { processes.filter(\.isZombie) }
+    /// Old dev servers that aren't already zombies, so the two select buttons don't overlap.
+    var stale: [DevProcess] { processes.filter { !$0.isZombie && $0.isStale(after: badgeMode.staleAfter) } }
 
     /// Stops processes and containers on a background queue, then removes what succeeded
     /// and leaves the rest in place with an alert.
@@ -259,7 +313,7 @@ struct ContentView: View {
         .safeAreaInset(edge: .bottom, spacing: 0) { bottomBar }
         .searchable(text: $search, placement: .toolbar, prompt: "Name, port, or path")
         .navigationTitle("Zombieport")
-        .navigationSubtitle(store.processes.count == 1 ? "1 server" : "\(store.processes.count) servers")
+        .navigationSubtitle(subtitle)
         .toolbar {
             ToolbarItemGroup(placement: .primaryAction) {
                 Toggle(isOn: $store.showAll) {
@@ -285,6 +339,12 @@ struct ContentView: View {
         } message: {
             Text(store.killFailures.joined(separator: "\n") + "\n\nThey may belong to another user, or their runtime may be unavailable.")
         }
+    }
+
+    private var subtitle: String {
+        let total = store.processes.count == 1 ? "1 server" : "\(store.processes.count) servers"
+        let flagged = store.zombies.count + store.stale.count
+        return flagged == 0 ? total : "\(total) · \(flagged) need\(flagged == 1 ? "s" : "") attention"
     }
 
     private func pruneSelection() {
@@ -317,6 +377,14 @@ struct ContentView: View {
                                 .background(Capsule().fill(.orange.opacity(0.2)))
                                 .foregroundStyle(.orange)
                                 .help("Its parent process is gone, so nothing will ever stop it")
+                        } else if p.isStale(after: store.badgeMode.staleAfter) {
+                            Text("stale")
+                                .font(.caption2.weight(.semibold))
+                                .padding(.horizontal, 5)
+                                .padding(.vertical, 1)
+                                .background(Capsule().fill(.secondary.opacity(0.2)))
+                                .foregroundStyle(.secondary)
+                                .help("Running for \(p.uptime), so you may have forgotten it")
                         }
                     }
                     Text([p.repoName, p.script].compactMap { $0 }.joined(separator: " · "))
@@ -382,6 +450,12 @@ struct ContentView: View {
                     selection = Set(store.zombies.map(\.id))
                 }
                 .help("Select every server whose parent process is gone")
+            }
+            if !store.stale.isEmpty {
+                Button("Select \(store.stale.count) Stale") {
+                    selection = Set(store.stale.map(\.id))
+                }
+                .help("Select every dev server older than the badge's age limit")
             }
             if selection.isEmpty {
                 Button("Select All") { selection = Set(rows.map(\.id)) }

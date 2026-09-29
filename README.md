@@ -56,6 +56,13 @@ behind the camera housing, open Zombieport again from Spotlight or Finder. To se
 - To show every process that listens on a TCP port, not only development runtimes,
   click **All Listeners** in the toolbar.
 
+The number next to the menu bar icon counts the servers that need your attention: zombies,
+whose parent shell is gone, and development servers that have run for more than 24 hours.
+The window tags these rows **zombie** or **stale**. Containers never count as stale,
+because databases and caches often run for days on purpose. When no server needs
+attention, the menu bar shows only the icon. To change what the number counts,
+right-click the icon, point to **Badge Counts**, and click an option.
+
 Under each name, Zombieport shows the Git repository and a short form of the command,
 such as `my-app · tsx src/server.ts`. The project name comes from the `name` field in `package.json` in the process's
 working directory. If that file doesn't exist, Zombieport uses the directory name.
