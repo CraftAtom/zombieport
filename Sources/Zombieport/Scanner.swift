@@ -1,7 +1,11 @@
 import Foundation
 
 struct DevProcess: Identifiable, Equatable {
+    enum Kind: Equatable { case process, container }
+
+    var kind: Kind = .process
     let pid: Int32
+    let ppid: Int32
     let command: String
     let args: String
     let cwd: String?
@@ -10,10 +14,19 @@ struct DevProcess: Identifiable, Equatable {
     let projectName: String
     let repoName: String?
     let script: String
+    /// Container name, used to stop container rows.
+    let container: String?
 
-    var id: Int32 { pid }
+    var id: String { kind == .container ? "c:\(container ?? "")" : "p:\(pid)" }
     var firstPort: Int { ports.first ?? 0 }
     var portsLabel: String { ports.map(String.init).joined(separator: ", ") }
+
+    /// The process was reparented to launchd, so the shell that started it is gone and
+    /// nothing will ever stop it. That is the "zombie" this app exists to find.
+    ///
+    /// Only dev runtimes qualify: GUI apps, agents, and launchd services all have PPID 1
+    /// by design, so flagging them would make "zombie" meaningless.
+    var isZombie: Bool { kind == .process && ppid == 1 && Scanner.isDevRuntime(command) }
 
     var uptime: String {
         let d = uptimeSeconds / 86400, h = uptimeSeconds % 86400 / 3600, m = uptimeSeconds % 3600 / 60
@@ -71,9 +84,80 @@ struct DevProcess: Identifiable, Equatable {
     }
 
     var displayPath: String {
-        guard let cwd else { return "unknown location" }
+        guard let cwd else { return kind == .container ? "container" : "unknown location" }
         let home = NSHomeDirectory()
         return cwd == home || cwd.hasPrefix(home + "/") ? "~" + cwd.dropFirst(home.count) : cwd
+    }
+
+    /// The key that groups servers belonging to one project: its repo, else its folder.
+    var projectKey: String? {
+        guard kind == .process else { return nil }
+        return repoName ?? cwd.map { ($0 as NSString).lastPathComponent }
+    }
+}
+
+enum Containers {
+    struct Info {
+        let id: String
+        let name: String
+        let image: String
+        let ports: [Int]
+        let uptime: Int
+    }
+
+    /// Running containers with published ports, from the Docker CLI (which also serves
+    /// OrbStack, Colima, and Docker Desktop). Returns `[]` when the CLI is missing, the
+    /// daemon is down, or nothing is published, so the app degrades to plain process
+    /// scanning with no error shown to the user.
+    static func list() -> [Info] {
+        // /usr/bin/env always exists; if docker doesn't, env exits non-zero with no output.
+        let out = Scanner.run(
+            "/usr/bin/env",
+            ["docker", "ps", "--no-trunc", "--format", "{{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Ports}}\t{{.Status}}"],
+            timeout: 3)
+        var result: [Info] = []
+        for line in out.split(separator: "\n") {
+            let f = line.split(separator: "\t", omittingEmptySubsequences: false).map(String.init)
+            guard f.count == 5 else { continue }
+            let ports = publishedPorts(f[3])
+            guard !ports.isEmpty else { continue }
+            result.append(Info(id: f[0], name: f[1], image: f[2], ports: ports, uptime: parseUptime(f[4])))
+        }
+        return result
+    }
+
+    /// Host ports from a docker ports string like
+    /// "0.0.0.0:5432->5432/tcp, [::]:5432->5432/tcp, 8080/tcp".
+    static func publishedPorts(_ s: String) -> [Int] {
+        var ports = Set<Int>()
+        for mapping in s.split(separator: ",") {
+            let part = mapping.trimmingCharacters(in: .whitespaces)
+            guard let arrow = part.range(of: "->") else { continue }   // "8080/tcp" is not published
+            let host = part[..<arrow.lowerBound]                        // "0.0.0.0:5432" or "[::]:5432"
+            guard let colon = host.lastIndex(of: ":") else { continue }
+            if let port = Int(host[host.index(after: colon)...]) { ports.insert(port) }
+        }
+        return ports.sorted()
+    }
+
+    /// Best-effort seconds from a docker status string ("Up 3 hours", "Up 2 days").
+    static func parseUptime(_ status: String) -> Int {
+        let words = status.lowercased().split(separator: " ")
+        guard let up = words.firstIndex(of: "up") else { return 0 }
+        let rest = words.dropFirst(up + 1)
+        func unit(_ word: Substring) -> Int {
+            if word.hasPrefix("second") { return 1 }
+            if word.hasPrefix("minute") { return 60 }
+            if word.hasPrefix("hour") { return 3600 }
+            if word.hasPrefix("day") { return 86400 }
+            if word.hasPrefix("week") { return 604_800 }
+            if word.hasPrefix("month") { return 2_592_000 }
+            if word.hasPrefix("year") { return 31_536_000 }
+            return 0
+        }
+        let count = rest.first.flatMap { Int($0) } ?? 1
+        guard let word = rest.first(where: { unit($0) > 0 }) else { return 0 }
+        return count * unit(word)
     }
 }
 
@@ -94,10 +178,16 @@ enum Scanner {
     }
 
     static func scan(showAll: Bool) -> [DevProcess] {
+        // Ports published by running containers, so their rows can replace the daemon
+        // process rows (which are not dev runtimes and can't be killed to free a port).
+        let containers = Containers.list()
+        var containerByPort: [Int: Containers.Info] = [:]
+        for c in containers { for port in c.ports { containerByPort[port] = c } }
+
         // pid -> (command, ports)
         var listeners: [Int32: (command: String, ports: Set<Int>)] = [:]
         var currentPid: Int32?
-        for line in run("/usr/sbin/lsof", ["+c", "0", "-nP", "-iTCP", "-sTCP:LISTEN", "-F", "pcn"])
+        for line in run("/usr/sbin/lsof", ["+c", "0", "-nP", "-iTCP", "-sTCP:LISTEN", "-F", "pcn"], timeout: 3)
             .split(separator: "\n") {
             let value = String(line.dropFirst())
             switch line.first {
@@ -117,41 +207,69 @@ enum Scanner {
         let pids = listeners
             .filter { showAll || isDevRuntime($0.value.command) }
             .map(\.key)
-        guard !pids.isEmpty else { return [] }
-        let pidList = pids.map(String.init).joined(separator: ",")
 
-        // Working directories.
-        var cwds: [Int32: String] = [:]
-        currentPid = nil
-        for line in run("/usr/sbin/lsof", ["-a", "-d", "cwd", "-p", pidList, "-F", "pn"]).split(separator: "\n") {
-            let value = String(line.dropFirst())
-            if line.first == "p" { currentPid = Int32(value) }
-            if line.first == "n", let pid = currentPid { cwds[pid] = value }
+        var rows: [DevProcess] = []
+        if !pids.isEmpty {
+            let pidList = pids.map(String.init).joined(separator: ",")
+
+            // Working directories.
+            var cwds: [Int32: String] = [:]
+            currentPid = nil
+            for line in run("/usr/sbin/lsof", ["-a", "-d", "cwd", "-p", pidList, "-F", "pn"], timeout: 3).split(separator: "\n") {
+                let value = String(line.dropFirst())
+                if line.first == "p" { currentPid = Int32(value) }
+                if line.first == "n", let pid = currentPid { cwds[pid] = value }
+            }
+
+            // Uptime, parent PID, and full command line.
+            var info: [Int32: (uptime: String, ppid: Int32, args: String)] = [:]
+            for line in run("/bin/ps", ["-o", "pid=,ppid=,etime=,args=", "-p", pidList], timeout: 3).split(separator: "\n") {
+                let parts = line.split(separator: " ", maxSplits: 3, omittingEmptySubsequences: true)
+                guard parts.count == 4, let pid = Int32(parts[0]) else { continue }
+                info[pid] = (String(parts[2]), Int32(parts[1]) ?? 0, String(parts[3]))
+            }
+
+            rows = pids.compactMap { pid in
+                guard let l = listeners[pid] else { return nil }
+                // Ports owned by a container belong to its row, not the daemon's.
+                let own = l.ports.filter { containerByPort[$0] == nil }.sorted()
+                if own.isEmpty { return nil }
+                return DevProcess(
+                    pid: pid,
+                    ppid: info[pid]?.ppid ?? 0,
+                    command: l.command,
+                    args: info[pid]?.args ?? l.command,
+                    cwd: cwds[pid],
+                    ports: own,
+                    uptimeSeconds: parseElapsed(info[pid]?.uptime ?? ""),
+                    projectName: DevProcess.projectName(cwd: cwds[pid], command: l.command),
+                    repoName: DevProcess.repoName(cwd: cwds[pid]),
+                    script: DevProcess.script(args: info[pid]?.args ?? "", command: l.command),
+                    container: nil
+                )
+            }
         }
 
-        // Uptime and full command line.
-        var info: [Int32: (uptime: String, args: String)] = [:]
-        for line in run("/bin/ps", ["-o", "pid=,etime=,args=", "-p", pidList]).split(separator: "\n") {
-            let parts = line.split(separator: " ", maxSplits: 2, omittingEmptySubsequences: true)
-            guard parts.count == 3, let pid = Int32(parts[0]) else { continue }
-            info[pid] = (String(parts[1]), String(parts[2]))
+        for c in containers {
+            rows.append(DevProcess(
+                kind: .container,
+                pid: 0,
+                ppid: 0,
+                command: c.image,
+                args: "docker stop \(c.name)",
+                cwd: nil,
+                ports: c.ports,
+                uptimeSeconds: c.uptime,
+                projectName: c.name,
+                repoName: "container",
+                script: c.image,
+                container: c.name
+            ))
         }
 
-        return pids.compactMap { pid in
-            guard let l = listeners[pid] else { return nil }
-            return DevProcess(
-                pid: pid,
-                command: l.command,
-                args: info[pid]?.args ?? l.command,
-                cwd: cwds[pid],
-                ports: l.ports.sorted(),
-                uptimeSeconds: parseElapsed(info[pid]?.uptime ?? ""),
-                projectName: DevProcess.projectName(cwd: cwds[pid], command: l.command),
-                repoName: DevProcess.repoName(cwd: cwds[pid]),
-                script: DevProcess.script(args: info[pid]?.args ?? "", command: l.command)
-            )
+        return rows.sorted {
+            ($0.ports.first ?? 0, $0.projectName) < ($1.ports.first ?? 0, $1.projectName)
         }
-        .sorted { ($0.ports.first ?? 0) < ($1.ports.first ?? 0) }
     }
 
     /// Parses ps etime, formatted as [[dd-]hh:]mm:ss.
@@ -177,6 +295,14 @@ enum Scanner {
         return true
     }
 
+    /// Runs `docker stop` (or `kill`). Returns false when the CLI is missing, the daemon
+    /// is down, or the container is gone, so the row can be restored with an alert.
+    static func stopContainer(_ name: String, force: Bool = false) -> Bool {
+        guard !name.isEmpty else { return false }
+        let out = run("/usr/bin/env", ["docker", force ? "kill" : "stop", name], timeout: 15)
+        return !out.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
     /// Process start time, used to tell a process apart from a later one with the same PID.
     private static func startTime(_ pid: Int32) -> UInt64? {
         var info = proc_bsdinfo()
@@ -185,7 +311,11 @@ enum Scanner {
         return info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec
     }
 
-    private static func run(_ path: String, _ args: [String]) -> String {
+    private final class Output { var data = Data() }
+
+    /// Runs a command and returns its stdout. Kills it after `timeout` seconds so a hung
+    /// `lsof`, `ps`, or unreachable Docker daemon can never stall the scan loop.
+    static func run(_ path: String, _ args: [String], timeout: TimeInterval = 5) -> String {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: path)
         process.arguments = args
@@ -193,8 +323,21 @@ enum Scanner {
         process.standardOutput = pipe
         process.standardError = FileHandle.nullDevice
         do { try process.run() } catch { return "" }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+
+        // Read on a separate queue so a full pipe buffer can't deadlock the wait.
+        let output = Output()
+        let done = DispatchSemaphore(value: 0)
+        DispatchQueue.global(qos: .userInitiated).async {
+            output.data = pipe.fileHandleForReading.readDataToEndOfFile()
+            done.signal()
+        }
+        if done.wait(timeout: .now() + timeout) == .timedOut {
+            process.terminate()
+            if done.wait(timeout: .now() + 1) == .timedOut {
+                Darwin.kill(process.processIdentifier, SIGKILL)
+            }
+        }
         process.waitUntilExit()
-        return String(decoding: data, as: UTF8.self)
+        return String(decoding: output.data, as: UTF8.self)
     }
 }

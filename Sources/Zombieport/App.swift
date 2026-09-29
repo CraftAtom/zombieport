@@ -1,14 +1,41 @@
 import AppKit
 import Combine
+import ServiceManagement
 import SwiftUI
 
 @main
 enum Main {
     static func main() {
+        // `Zombieport --selftest` checks the platform parsers and exits non-zero on failure.
+        if CommandLine.arguments.contains("--selftest") {
+            let portCases: [(String, [Int])] = [
+                ("0.0.0.0:5432->5432/tcp, [::]:5432->5432/tcp, 8080/tcp", [5432]),
+                ("127.0.0.1:8080->80/tcp", [8080]),
+                ("", []),
+            ]
+            for (input, want) in portCases where Containers.publishedPorts(input) != want {
+                print("FAIL ports: \(input)"); exit(1)
+            }
+            let uptimeCases: [(String, Int)] = [
+                ("Up 3 hours", 10800), ("Up 2 days", 172800),
+                ("Up About an hour", 3600), ("Exited (0) 5 minutes ago", 0),
+            ]
+            for (input, want) in uptimeCases where Containers.parseUptime(input) != want {
+                print("FAIL uptime: \(input)"); exit(1)
+            }
+            let elapsedCases: [(String, Int)] = [("2-03:04:05", 183845), ("04:05", 245), ("05", 5)]
+            for (input, want) in elapsedCases where Scanner.parseElapsed(input) != want {
+                print("FAIL elapsed: \(input)"); exit(1)
+            }
+            print("selftest ok")
+            return
+        }
         // `Zombieport --list [--all]` prints what the window would show and exits.
         if CommandLine.arguments.contains("--list") {
             for p in Scanner.scan(showAll: CommandLine.arguments.contains("--all")) {
-                print("\(p.pid)\t\(p.portsLabel)\t\(p.projectName)\t\(p.repoName ?? "-")\t\(p.script)\t\(p.displayPath)")
+                let pid = p.kind == .container ? "-" : String(p.pid)
+                let state = p.kind == .container ? "container" : (p.isZombie ? "zombie" : "process")
+                print("\(pid)\t\(p.portsLabel)\t\(p.projectName)\t\(p.repoName ?? "-")\t\(p.script)\t\(p.displayPath)\t\(state)")
             }
             return
         }
@@ -17,6 +44,23 @@ enum Main {
         app.delegate = delegate
         app.setActivationPolicy(.accessory)
         app.run()
+    }
+}
+
+/// Registers the app as a login item through the modern Service Management API.
+/// Fails cleanly on unsigned dev builds, where the toggle shows an alert instead.
+enum LoginItem {
+    static var isEnabled: Bool { SMAppService.mainApp.status == .enabled }
+
+    @discardableResult
+    static func set(_ enabled: Bool) -> Bool {
+        do {
+            if enabled { try SMAppService.mainApp.register() }
+            else { try SMAppService.mainApp.unregister() }
+            return true
+        } catch {
+            return false
+        }
     }
 }
 
@@ -79,6 +123,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let menu = NSMenu()
             menu.addItem(withTitle: "Open Zombieport", action: #selector(showWindow), keyEquivalent: "").target = self
             menu.addItem(.separator())
+            let login = NSMenuItem(title: "Launch at Login", action: #selector(toggleLoginItem), keyEquivalent: "")
+            login.target = self
+            login.state = LoginItem.isEnabled ? .on : .off
+            menu.addItem(login)
+            menu.addItem(.separator())
             menu.addItem(withTitle: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
             statusItem.menu = menu
             statusItem.button?.performClick(nil)
@@ -90,6 +139,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else {
             showWindow()
         }
+    }
+
+    @objc private func toggleLoginItem() {
+        let enable = !LoginItem.isEnabled
+        guard !LoginItem.set(enable) else { return }
+        let alert = NSAlert()
+        alert.messageText = "Couldn't \(enable ? "enable" : "disable") Launch at Login"
+        alert.informativeText = "Move Zombieport to /Applications and try again."
+        alert.runModal()
     }
 
     @objc private func showWindow() {
@@ -122,7 +180,10 @@ final class ProcessStore: ObservableObject {
             refresh()
         }
     }
+    /// Rows that couldn't be stopped, shown in an alert.
+    @Published var killFailures: [String] = []
     private var timer: Timer?
+    private var scanning = false
 
     init() {
         refresh()
@@ -130,29 +191,51 @@ final class ProcessStore: ObservableObject {
     }
 
     func refresh() {
+        // Skip if the previous scan is still running, so a slow docker/lsof call can't
+        // pile up one stuck process every five seconds.
+        guard !scanning else { return }
+        scanning = true
         let showAll = showAll
         DispatchQueue.global(qos: .userInitiated).async {
             let result = Scanner.scan(showAll: showAll)
             DispatchQueue.main.async {
+                self.scanning = false
                 if result != self.processes { self.processes = result }
             }
         }
     }
 
-    /// Names of processes that couldn't be stopped, shown in an alert.
-    @Published var killFailures: [String] = []
+    var zombies: [DevProcess] { processes.filter(\.isZombie) }
 
-    func kill(_ pids: Set<Int32>, force: Bool = false) {
-        let failed = pids.filter { !Scanner.kill($0, force: force) }
-        killFailures = processes.filter { failed.contains($0.pid) }.map { "\($0.projectName) (PID \($0.pid))" }
-        processes.removeAll { pids.contains($0.pid) && !failed.contains($0.pid) }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { self.refresh() }
+    /// Stops processes and containers on a background queue, then removes what succeeded
+    /// and leaves the rest in place with an alert.
+    func kill(_ ids: Set<String>, force: Bool = false) {
+        let targets = processes.filter { ids.contains($0.id) }
+        guard !targets.isEmpty else { return }
+        DispatchQueue.global(qos: .userInitiated).async {
+            var failed = Set<String>()
+            for target in targets {
+                let ok: Bool
+                switch target.kind {
+                case .container: ok = Scanner.stopContainer(target.container ?? "", force: force)
+                case .process: ok = Scanner.kill(target.pid, force: force)
+                }
+                if !ok { failed.insert(target.id) }
+            }
+            DispatchQueue.main.async {
+                self.killFailures = targets
+                    .filter { failed.contains($0.id) }
+                    .map { "\($0.projectName) (\($0.kind == .container ? "container" : "PID \($0.pid)"))" }
+                self.processes.removeAll { ids.contains($0.id) && !failed.contains($0.id) }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) { self.refresh() }
+            }
+        }
     }
 }
 
 struct ContentView: View {
     @ObservedObject var store: ProcessStore
-    @State private var selection = Set<Int32>()
+    @State private var selection = Set<String>()
     @State private var sortOrder = [KeyPathComparator(\DevProcess.firstPort)]
     @State private var search = ""
 
@@ -200,12 +283,12 @@ struct ContentView: View {
         ) {
             Button("OK") {}
         } message: {
-            Text(store.killFailures.joined(separator: "\n") + "\n\nThey may belong to another user or to the system.")
+            Text(store.killFailures.joined(separator: "\n") + "\n\nThey may belong to another user, or their runtime may be unavailable.")
         }
     }
 
     private func pruneSelection() {
-        selection.formIntersection(rows.map(\.pid))
+        selection.formIntersection(rows.map(\.id))
     }
 
     private var table: some View {
@@ -224,7 +307,18 @@ struct ContentView: View {
             .width(min: 70, ideal: 100)
             TableColumn("Name", value: \.projectName) { p in
                 VStack(alignment: .leading, spacing: 2) {
-                    Text(p.projectName).fontWeight(.semibold)
+                    HStack(spacing: 6) {
+                        Text(p.projectName).fontWeight(.semibold)
+                        if p.isZombie {
+                            Text("zombie")
+                                .font(.caption2.weight(.semibold))
+                                .padding(.horizontal, 5)
+                                .padding(.vertical, 1)
+                                .background(Capsule().fill(.orange.opacity(0.2)))
+                                .foregroundStyle(.orange)
+                                .help("Its parent process is gone, so nothing will ever stop it")
+                        }
+                    }
                     Text([p.repoName, p.script].compactMap { $0 }.joined(separator: " · "))
                         .font(.caption)
                         .foregroundStyle(.secondary)
@@ -243,7 +337,9 @@ struct ContentView: View {
             }
             .width(min: 160, ideal: 280)
             TableColumn("PID", value: \.pid) { p in
-                Text(verbatim: String(p.pid)).monospacedDigit().foregroundStyle(.secondary)
+                Text(verbatim: p.kind == .container ? "—" : String(p.pid))
+                    .monospacedDigit()
+                    .foregroundStyle(.secondary)
             }
             .width(min: 50, ideal: 60)
             TableColumn("Uptime", value: \.uptimeSeconds) { p in
@@ -251,11 +347,11 @@ struct ContentView: View {
             }
             .width(min: 50, ideal: 70)
         }
-        .contextMenu(forSelectionType: Int32.self) { pids in
-            contextMenu(for: pids)
-        } primaryAction: { pids in
+        .contextMenu(forSelectionType: String.self) { ids in
+            contextMenu(for: ids)
+        } primaryAction: { ids in
             // Double-click opens the first port in the browser.
-            openInBrowser(pids)
+            openInBrowser(ids)
         }
         // Scoped to the table so Delete in the search field only edits text.
         .onDeleteCommand { store.kill(selection) }
@@ -281,8 +377,14 @@ struct ContentView: View {
                 .font(.callout)
                 .foregroundStyle(.secondary)
             Spacer()
+            if !store.zombies.isEmpty {
+                Button("Select \(store.zombies.count) Zombie\(store.zombies.count == 1 ? "" : "s")") {
+                    selection = Set(store.zombies.map(\.id))
+                }
+                .help("Select every server whose parent process is gone")
+            }
             if selection.isEmpty {
-                Button("Select All") { selection = Set(rows.map(\.pid)) }
+                Button("Select All") { selection = Set(rows.map(\.id)) }
                     .disabled(rows.isEmpty)
             } else {
                 Button("Deselect") { selection.removeAll() }
@@ -305,27 +407,38 @@ struct ContentView: View {
     }
 
     @ViewBuilder
-    private func contextMenu(for pids: Set<Int32>) -> some View {
-        let selected = store.processes.filter { pids.contains($0.pid) }
+    private func contextMenu(for ids: Set<String>) -> some View {
+        let selected = store.processes.filter { ids.contains($0.id) }
         if !selected.isEmpty {
-            Button(pids.count == 1 ? "Kill" : "Kill \(pids.count) Processes") { store.kill(pids) }
-            Button("Force Kill (SIGKILL)") { store.kill(pids, force: true) }
+            Button(ids.count == 1 ? "Kill" : "Kill \(ids.count) Processes") { store.kill(ids) }
+            Button("Force Kill") { store.kill(ids, force: true) }
             Divider()
-            Button("Open in Browser") { openInBrowser(pids) }
+            Button("Open in Browser") { openInBrowser(ids) }
+            Button("Open in Browser (HTTPS)") { openInBrowser(ids, https: true) }
+            // Offer to stop the rest of the same project in one click.
+            if let key = selected.first?.projectKey {
+                let siblings = store.processes.filter { $0.projectKey == key && !ids.contains($0.id) }
+                if !siblings.isEmpty {
+                    Button("Stop \(siblings.count) more in \(selected.first?.repoName ?? key)") {
+                        store.kill(Set(siblings.map(\.id)))
+                    }
+                }
+            }
             if selected.count == 1, let p = selected.first {
                 if let cwd = p.cwd {
                     Button("Reveal in Finder") { NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: cwd) }
                     Button("Copy Path") { copy(cwd) }
                 }
                 Button("Copy Command") { copy(p.args) }
-                Button("Copy PID") { copy(String(p.pid)) }
+                if p.kind == .process { Button("Copy PID") { copy(String(p.pid)) } }
+                if p.isZombie { Button("Kill Zombie") { store.kill([p.id]) } }
             }
         }
     }
 
-    private func openInBrowser(_ pids: Set<Int32>) {
-        for p in store.processes where pids.contains(p.pid) {
-            if let port = p.ports.first { PortChip.open(port) }
+    private func openInBrowser(_ ids: Set<String>, https: Bool = false) {
+        for p in store.processes where ids.contains(p.id) {
+            if let port = p.ports.first { PortChip.open(port, https: https) }
         }
     }
 
@@ -339,8 +452,8 @@ struct PortChip: View {
     let port: Int
     @State private var hovering = false
 
-    static func open(_ port: Int) {
-        if let url = URL(string: "http://localhost:\(port)") { NSWorkspace.shared.open(url) }
+    static func open(_ port: Int, https: Bool = false) {
+        if let url = URL(string: "\(https ? "https" : "http")://localhost:\(port)") { NSWorkspace.shared.open(url) }
     }
 
     var body: some View {
