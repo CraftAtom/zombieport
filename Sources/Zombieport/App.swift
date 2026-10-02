@@ -487,8 +487,22 @@ struct ContentView: View {
             Button(ids.count == 1 ? "Kill" : "Kill \(ids.count) Processes") { store.kill(ids) }
             Button("Force Kill") { store.kill(ids, force: true) }
             Divider()
-            Button("Open in Browser") { openInBrowser(ids) }
-            Button("Open in Browser (HTTPS)") { openInBrowser(ids, https: true) }
+            // A single row with several ports gets a submenu so any port can be opened.
+            if selected.count == 1, let ports = selected.first?.ports, ports.count > 1 {
+                Menu("Open in Browser") {
+                    ForEach(ports, id: \.self) { port in
+                        Button(String("localhost:\(port)")) { PortChip.open(port) }
+                    }
+                }
+                Menu("Open in Browser (HTTPS)") {
+                    ForEach(ports, id: \.self) { port in
+                        Button(String("localhost:\(port)")) { PortChip.open(port, https: true) }
+                    }
+                }
+            } else {
+                Button("Open in Browser") { openInBrowser(ids) }
+                Button("Open in Browser (HTTPS)") { openInBrowser(ids, https: true) }
+            }
             // Offer to stop the rest of the same project in one click.
             if let key = selected.first?.projectKey {
                 let siblings = store.processes.filter { $0.projectKey == key && !ids.contains($0.id) }
