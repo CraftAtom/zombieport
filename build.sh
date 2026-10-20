@@ -15,7 +15,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 <plist version="1.0">
 <dict>
   <key>CFBundleName</key><string>Zombieport</string>
-  <key>CFBundleIdentifier</key><string>dev.zombieport.app</string>
+  <key>CFBundleIdentifier</key><string>com.craftatom.zombieport</string>
   <key>CFBundleExecutable</key><string>Zombieport</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
