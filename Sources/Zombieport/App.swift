@@ -35,6 +35,7 @@ enum Main {
             for p in Scanner.scan(showAll: CommandLine.arguments.contains("--all")) {
                 let pid = p.kind == .container ? "-" : String(p.pid)
                 let state = p.kind == .container ? "container"
+                    : p.appName != nil ? "app"
                     : p.isZombie ? "zombie"
                     : p.isStale(after: BadgeMode.staleDay.staleAfter) ? "stale" : "process"
                 print("\(pid)\t\(p.portsLabel)\t\(p.projectName)\t\(p.repoName ?? "-")\t\(p.script)\t\(p.displayPath)\t\(state)")
@@ -292,6 +293,14 @@ struct ContentView: View {
     @State private var selection = Set<String>()
     @State private var sortOrder = [KeyPathComparator(\DevProcess.firstPort)]
     @State private var search = ""
+    @State private var pendingKill: PendingKill?
+
+    /// A kill that waits for confirmation because it includes processes that apps started.
+    struct PendingKill {
+        let ids: Set<String>
+        let force: Bool
+        let apps: [String]
+    }
 
     private var rows: [DevProcess] {
         let q = search.trimmingCharacters(in: .whitespaces).lowercased()
@@ -339,6 +348,27 @@ struct ContentView: View {
         } message: {
             Text(store.killFailures.joined(separator: "\n") + "\n\nThey may belong to another user, or their runtime may be unavailable.")
         }
+        .alert(
+            "Stop processes that apps depend on?",
+            isPresented: Binding(get: { pendingKill != nil }, set: { if !$0 { pendingKill = nil } }),
+            presenting: pendingKill
+        ) { k in
+            Button(k.force ? "Force Kill" : "Kill", role: .destructive) { store.kill(k.ids, force: k.force) }
+            Button("Cancel", role: .cancel) {}
+        } message: { k in
+            Text("\(k.apps.formatted(.list(type: .and))) started some of the selected processes. Stopping them can make \(k.apps.count == 1 ? "that app" : "those apps") quit or stop working.")
+        }
+    }
+
+    /// Stops the rows, but asks first when any of them belongs to an app, because an app
+    /// such as Raycast quits when its helper process stops.
+    private func requestKill(_ ids: Set<String>, force: Bool = false) {
+        let apps = Set(store.processes.filter { ids.contains($0.id) }.compactMap(\.appName)).sorted()
+        if apps.isEmpty {
+            store.kill(ids, force: force)
+        } else {
+            pendingKill = PendingKill(ids: ids, force: force, apps: apps)
+        }
     }
 
     private var subtitle: String {
@@ -369,7 +399,15 @@ struct ContentView: View {
                 VStack(alignment: .leading, spacing: 2) {
                     HStack(spacing: 6) {
                         Text(p.projectName).fontWeight(.semibold)
-                        if p.isZombie {
+                        if let app = p.appName {
+                            Text("app")
+                                .font(.caption2.weight(.semibold))
+                                .padding(.horizontal, 5)
+                                .padding(.vertical, 1)
+                                .background(Capsule().fill(.blue.opacity(0.2)))
+                                .foregroundStyle(.blue)
+                                .help("\(app) started this process, so stopping it can make \(app) quit")
+                        } else if p.isZombie {
                             Text("zombie")
                                 .font(.caption2.weight(.semibold))
                                 .padding(.horizontal, 5)
@@ -422,7 +460,7 @@ struct ContentView: View {
             openInBrowser(ids)
         }
         // Scoped to the table so Delete in the search field only edits text.
-        .onDeleteCommand { store.kill(selection) }
+        .onDeleteCommand { requestKill(selection) }
     }
 
     private var emptyState: some View {
@@ -464,7 +502,7 @@ struct ContentView: View {
                 Button("Deselect") { selection.removeAll() }
             }
             Button(role: .destructive) {
-                store.kill(selection)
+                requestKill(selection)
             } label: {
                 Label(selection.count > 1 ? "Kill \(selection.count)" : "Kill", systemImage: "xmark.octagon.fill")
             }
@@ -484,8 +522,8 @@ struct ContentView: View {
     private func contextMenu(for ids: Set<String>) -> some View {
         let selected = store.processes.filter { ids.contains($0.id) }
         if !selected.isEmpty {
-            Button(ids.count == 1 ? "Kill" : "Kill \(ids.count) Processes") { store.kill(ids) }
-            Button("Force Kill") { store.kill(ids, force: true) }
+            Button(ids.count == 1 ? "Kill" : "Kill \(ids.count) Processes") { requestKill(ids) }
+            Button("Force Kill") { requestKill(ids, force: true) }
             Divider()
             // A single row with several ports gets a submenu so any port can be opened.
             if selected.count == 1, let ports = selected.first?.ports, ports.count > 1 {

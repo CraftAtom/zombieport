@@ -16,6 +16,9 @@ struct DevProcess: Identifiable, Equatable {
     let script: String
     /// Container name, used to stop container rows.
     let container: String?
+    /// The app that started the process, such as "Raycast" for its Node.js backend.
+    /// Stopping such a process can make the app quit, so it is never a zombie or stale.
+    var appName: String? = nil
 
     var id: String { kind == .container ? "c:\(container ?? "")" : "p:\(pid)" }
     var firstPort: Int { ports.first ?? 0 }
@@ -26,13 +29,14 @@ struct DevProcess: Identifiable, Equatable {
     ///
     /// Only dev runtimes qualify: GUI apps, agents, and launchd services all have PPID 1
     /// by design, so flagging them would make "zombie" meaningless.
-    var isZombie: Bool { kind == .process && ppid == 1 && Scanner.isDevRuntime(command) }
+    var isZombie: Bool { kind == .process && appName == nil && ppid == 1 && Scanner.isDevRuntime(command) }
 
     /// A dev server that has run for at least `seconds`, which usually means you forgot it.
-    /// Containers are excluded because databases and caches often run for days on purpose.
+    /// Containers are excluded because databases and caches often run for days on purpose,
+    /// and app processes because they run as long as their app does.
     func isStale(after seconds: Int?) -> Bool {
         guard let seconds else { return false }
-        return kind == .process && uptimeSeconds >= seconds && Scanner.isDevRuntime(command)
+        return kind == .process && appName == nil && uptimeSeconds >= seconds && Scanner.isDevRuntime(command)
     }
 
     var uptime: String {
@@ -98,7 +102,7 @@ struct DevProcess: Identifiable, Equatable {
 
     /// The key that groups servers belonging to one project: its repo, else its folder.
     var projectKey: String? {
-        guard kind == .process else { return nil }
+        guard kind == .process, appName == nil else { return nil }
         return repoName ?? cwd.map { ($0 as NSString).lastPathComponent }
     }
 }
@@ -241,6 +245,7 @@ enum Scanner {
                 // Ports owned by a container belong to its row, not the daemon's.
                 let own = l.ports.filter { containerByPort[$0] == nil }.sorted()
                 if own.isEmpty { return nil }
+                let app = owningApp(pid)
                 return DevProcess(
                     pid: pid,
                     ppid: info[pid]?.ppid ?? 0,
@@ -249,10 +254,11 @@ enum Scanner {
                     cwd: cwds[pid],
                     ports: own,
                     uptimeSeconds: parseElapsed(info[pid]?.uptime ?? ""),
-                    projectName: DevProcess.projectName(cwd: cwds[pid], command: l.command),
+                    projectName: app ?? DevProcess.projectName(cwd: cwds[pid], command: l.command),
                     repoName: DevProcess.repoName(cwd: cwds[pid]),
                     script: DevProcess.script(args: info[pid]?.args ?? "", command: l.command),
-                    container: nil
+                    container: nil,
+                    appName: app
                 )
             }
         }
@@ -310,12 +316,43 @@ enum Scanner {
         return !out.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
+    /// Name of the app that started a process, such as "Raycast" for the Node.js backend
+    /// it runs. Walks up through dev runtimes (node started by npm, and so on) and stops at
+    /// the first other process, so a server started from a terminal shell has no app.
+    static func owningApp(_ pid: Int32) -> String? {
+        var pid = pid
+        for _ in 0..<8 {
+            guard pid > 1, let path = executablePath(pid) else { return nil }
+            // "/Applications/Raycast.app/Contents/MacOS/Raycast" -> "Raycast". The first
+            // ".app/" is the outer app, so helper apps nested inside it resolve to it too.
+            if let range = path.range(of: ".app/") {
+                return (String(path[..<range.lowerBound]) as NSString).lastPathComponent
+            }
+            guard isDevRuntime((path as NSString).lastPathComponent), let parent = bsdInfo(pid)?.pbi_ppid else {
+                return nil
+            }
+            pid = Int32(parent)
+        }
+        return nil
+    }
+
+    private static func executablePath(_ pid: Int32) -> String? {
+        var buffer = [CChar](repeating: 0, count: 4 * Int(MAXPATHLEN))
+        guard proc_pidpath(pid, &buffer, UInt32(buffer.count)) > 0 else { return nil }
+        return String(cString: buffer)
+    }
+
     /// Process start time, used to tell a process apart from a later one with the same PID.
     private static func startTime(_ pid: Int32) -> UInt64? {
+        guard let info = bsdInfo(pid) else { return nil }
+        return info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec
+    }
+
+    private static func bsdInfo(_ pid: Int32) -> proc_bsdinfo? {
         var info = proc_bsdinfo()
         let size = Int32(MemoryLayout<proc_bsdinfo>.size)
         guard proc_pidinfo(pid, PROC_PIDTBSDINFO, 0, &info, size) == size else { return nil }
-        return info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec
+        return info
     }
 
     private final class Output { var data = Data() }

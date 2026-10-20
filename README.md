@@ -63,6 +63,14 @@ because databases and caches often run for days on purpose. When no server needs
 attention, the menu bar shows only the icon. To change what the number counts,
 right-click the icon, point to **Badge Counts**, and click an option.
 
+Some apps run their own Node.js or Python helper that listens on a port. For example,
+Raycast runs a Node.js backend, and Raycast quits when that backend stops. Zombieport
+shows these rows with the app's name and tags them **app**. App processes never count as
+zombies or stale, and Zombieport asks you to confirm before it stops one. A process
+belongs to an app when the app's executable is inside a `.app` bundle and the app
+started the process directly or through other development runtimes. A server that you
+start from a terminal belongs to the shell, so it never counts as an app process.
+
 Under each name, Zombieport shows the Git repository and a short form of the command,
 such as `my-app · tsx src/server.ts`. The project name comes from the `name` field in `package.json` in the process's
 working directory. If that file doesn't exist, Zombieport uses the directory name.
