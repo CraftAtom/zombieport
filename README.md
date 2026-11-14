@@ -108,6 +108,51 @@ such as `my-app · tsx src/server.ts`. The project name comes from the `name` fi
 working directory. If that file doesn't exist, Zombieport uses the directory name.
 The list refreshes every five seconds.
 
+## Monitor temperature and CPU load
+
+Zombieport shows the CPU temperature next to the menu bar icon, and it shows the processes
+that use the most CPU. The temperature is the hottest CPU die sensor, rounded to whole
+degrees Celsius. With 3 servers that need attention and a 68 °C CPU, the menu bar shows
+`3 · 68°`. With no servers that need attention, it shows `68°`.
+
+Zombieport reads the temperature through an undocumented macOS interface. The interface
+needs no root access, but a future macOS release can change or remove it. If Zombieport
+can't read a sensor, it shows no temperature and the rest of the app works as usual.
+
+To hide the temperature, right-click the menu bar icon and clear **Show Temperature**.
+While **Show Temperature** is cleared, the temperature still appears when macOS reports
+a thermal state other than nominal, which means the Mac is throttling its performance.
+
+### View system load
+
+To open the System view, click **System** in the window toolbar. Zombieport reopens the
+window on the view that you used last. The System view shows:
+
+- The hottest CPU temperature, with the average in smaller text, and the SSD temperature
+  when the Mac reports it.
+- The thermal state, the CPU usage, the load averages for 1, 5, and 15 minutes, and the
+  memory in use with the memory pressure level.
+- A table of up to 15 processes that use at least 0.5% of a CPU core, sorted by CPU use.
+  To filter the table, type in the search field.
+
+Zombieport samples the process list only while the System view is visible, so a hidden
+window adds no load. A value that Zombieport can't read shows as **Unavailable**.
+
+To see a summary without opening the window, right-click the menu bar icon. The top of the
+menu shows the CPU temperature, the load, the memory pressure, and the three busiest
+processes. To open the System view, click any of these rows.
+
+### Stop a busy process
+
+To stop a process that you own, right-click its row, or click the actions button at the end
+of the row, and click **Kill** or **Force Kill**. Zombieport asks you to confirm and names the
+process and its PID.
+
+Root-owned processes need Terminal. For a process that another user owns, the menu offers
+**Copy sudo kill command** and **Copy sudo force-kill command**. Run the copied command in
+Terminal. For critical system processes, such as `kernel_task`, `launchd`, `WindowServer`,
+and `loginwindow`, Zombieport offers no kill action. Any process has **Copy PID**.
+
 ## List servers from the terminal
 
 To print the list without opening the window, run the binary with `--list`. Add `--all`
@@ -115,6 +160,13 @@ to include every listener.
 
 ```sh
 build/Zombieport.app/Contents/MacOS/Zombieport --list
+```
+
+To print the temperatures, the system load, and the busiest processes, run the binary with
+`--system`:
+
+```sh
+build/Zombieport.app/Contents/MacOS/Zombieport --system
 ```
 
 ## Sign and notarize the app
